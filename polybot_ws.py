@@ -2,6 +2,7 @@ import collections
 import curses
 import json
 import math
+import random
 import threading
 import time
 from datetime import datetime, timezone
@@ -18,7 +19,9 @@ MAX_PAPER_ROWS = 50
 PAPER_BUY_PRICE = 0.45
 PAPER_SELL_PRICE = 0.55
 PING_INTERVAL = 10
-VOL_WINDOW = 300  # 5 minutes of price history for volatility
+VOL_WINDOW = 3600  # 60 minutes of price history for volatility & MC
+MC_SIMS = 10_000   # number of Monte Carlo paths
+MC_INTERVAL = 5    # seconds between MC recalculations
 SECONDS_PER_YEAR = 365.25 * 24 * 3600
 
 
@@ -90,6 +93,11 @@ class OrderBook:
         self.volatility: float = 0.0  # annualized vol
         self.bs_call: float = 0.5     # BS binary call (Up) fair price
         self.bs_put: float = 0.5      # BS binary put (Down) fair price
+        # Monte Carlo pricing
+        self.mc_call: float = 0.5
+        self.mc_put: float = 0.5
+        self._mc_last_run: float = 0.0
+        self._mc_elapsed_ms: float = 0.0  # last MC computation time
         # paper trading
         # orders: {(outcome, side): {"price": float, "filled": bool, "fill_time": float}}
         self._paper_orders: dict[tuple, dict] = {}
@@ -279,6 +287,38 @@ class OrderBook:
             t_remaining = max(self.expires_ts - time.time(), 0) / SECONDS_PER_YEAR
             self.bs_call = bs_binary_call(self.btc_price, self.strike_price, t_remaining, self.volatility)
             self.bs_put = 1.0 - self.bs_call
+
+        # run Monte Carlo on a timer (every MC_INTERVAL seconds)
+        now = time.time()
+        if now - self._mc_last_run >= MC_INTERVAL and len(log_returns) >= 10:
+            self._run_monte_carlo(log_returns, avg_dt)
+            self._mc_last_run = now
+
+    def _run_monte_carlo(self, log_returns: list[float], avg_dt: float):
+        """Bootstrap Monte Carlo: sample observed returns to simulate paths to expiry. Called with lock held."""
+        remaining_s = max(self.expires_ts - time.time(), 0)
+        if remaining_s <= 0 or self.strike_price <= 0 or self.btc_price <= 0:
+            return
+
+        t0 = time.perf_counter()
+
+        # number of time steps = remaining seconds / average dt between observations
+        n_steps = max(1, int(remaining_s / avg_dt))
+        current = self.btc_price
+        strike = self.strike_price
+
+        # pre-compute: for each simulation, sample n_steps log returns,
+        # sum them, and check if final price >= strike
+        above = 0
+        for _ in range(MC_SIMS):
+            total_log_return = sum(random.choices(log_returns, k=n_steps))
+            final_price = current * math.exp(total_log_return)
+            if final_price >= strike:
+                above += 1
+
+        self.mc_call = above / MC_SIMS
+        self.mc_put = 1.0 - self.mc_call
+        self._mc_elapsed_ms = (time.perf_counter() - t0) * 1000
 
     def _init_paper_orders(self):
         """Place paper orders for the new market. Called with lock held."""
@@ -500,6 +540,9 @@ class OrderBook:
                 self.bs_call,
                 self.bs_put,
                 self.volatility,
+                self.mc_call,
+                self.mc_put,
+                self._mc_elapsed_ms,
             )
 
 
@@ -697,7 +740,7 @@ def draw(stdscr, ob: OrderBook):
         if key == ord("q"):
             return
 
-        asset_ids, title, slug, expires_ts, connected, msg_count, rotations, strike_price, btc_price, bs_call, bs_put, volatility = ob.get_snapshot()
+        asset_ids, title, slug, expires_ts, connected, msg_count, rotations, strike_price, btc_price, bs_call, bs_put, volatility, mc_call, mc_put, mc_ms = ob.get_snapshot()
 
         h, w = stdscr.getmaxyx()
         stdscr.erase()
@@ -851,6 +894,7 @@ def draw(stdscr, ob: OrderBook):
         spread_row = None
         if row < h - 2:
             bs_prices = [bs_call, bs_put]  # Up=call, Down=put
+            mc_prices = [mc_call, mc_put]
             for i, (bids, asks) in enumerate(levels):
                 x = left_x if i == 0 else right_x
                 best_bid = f"{float(bids[0][0]):.2f}" if bids else "-.--"
@@ -866,6 +910,29 @@ def draw(stdscr, ob: OrderBook):
                 except curses.error:
                     pass
             spread_row = row
+            row += 1
+
+        # MC fair price line (below BS spread)
+        if row < h - 2 and mc_ms > 0:
+            mc_prices = [mc_call, mc_put]
+            for i, (bids, asks) in enumerate(levels):
+                x = left_x if i == 0 else right_x
+                mc_fair = mc_prices[i]
+                mc_str = f" MC [{mc_fair:.2f}] "
+                padded = f"{mc_str:\u2500^{COL_W}}"
+                try:
+                    stdscr.addnstr(row, x, padded, COL_W, MAGENTA)
+                except curses.error:
+                    pass
+            # MC timing in the gap
+            gap_start = left_x + COL_W
+            gap_width = right_x - gap_start
+            ms_str = f"{mc_ms:.0f}ms"
+            ms_x = gap_start + max(0, (gap_width - len(ms_str)) // 2)
+            try:
+                stdscr.addnstr(row, ms_x, ms_str, gap_width, MAGENTA | DIM)
+            except curses.error:
+                pass
             row += 1
 
         # bids header
