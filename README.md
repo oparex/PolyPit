@@ -1,4 +1,5 @@
 # PolyPit
+<img width="1688" height="902" alt="polyPit" src="https://github.com/user-attachments/assets/5868e73b-3e54-4d2e-9c44-0ebad4c7a2bf" />
 
 Real-time trading terminal for Polymarket BTC 5-minute binary options. Streams live order books via WebSocket, detects arbitrage opportunities, simulates paper trades, and computes Black-Scholes fair prices — all in a curses-based terminal UI.
 
