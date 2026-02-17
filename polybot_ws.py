@@ -104,8 +104,6 @@ class OrderBook:
         self._market_up_cost: float = 0.0   # sum(price * size) for VWAP
         self._market_down_vol: float = 0.0
         self._market_down_cost: float = 0.0
-        self._market_last_up: float = 0.0   # last traded price for Up
-        self._market_last_down: float = 0.0  # last traded price for Down
         self.market_stats: list[dict] = []
 
     def set_market(self, slug: str, title: str, asset_ids: list[str],
@@ -133,8 +131,6 @@ class OrderBook:
             self._market_up_cost = 0.0
             self._market_down_vol = 0.0
             self._market_down_cost = 0.0
-            self._market_last_up = 0.0
-            self._market_last_down = 0.0
             # close any active arbs from the old market before rotating
             now = time.time()
             for arb_type in list(self._active_arbs):
@@ -159,13 +155,11 @@ class OrderBook:
                 self.volume_up[key] = self.volume_up.get(key, 0.0) + vol
                 self._market_up_vol += vol
                 self._market_up_cost += p * vol
-                self._market_last_up = p
             elif name == "Down":
                 key = f"{round(1.0 - p, 2):.2f}"
                 self.volume_down[key] = self.volume_down.get(key, 0.0) + vol
                 self._market_down_vol += vol
                 self._market_down_cost += p * vol
-                self._market_last_down = p
 
     def get_trades(self, max_rows: int) -> list:
         with self.lock:
@@ -417,11 +411,9 @@ class OrderBook:
             "up_vol": self._market_up_vol,
             "up_avg": up_avg,
             "up_net": up_net,
-            "up_last": self._market_last_up,
             "down_vol": self._market_down_vol,
             "down_avg": down_avg,
             "down_net": down_net,
-            "down_last": self._market_last_down,
             "strike": self.strike_price,
             "min_up": self._paper_min_up if self._paper_min_up != float("inf") else 0.0,
             "max_up": self._paper_max_up,
@@ -1101,9 +1093,9 @@ def draw(stdscr, ob: OrderBook):
         if stats and STATS_X < w - 10 and stats_row < h - 3:
             stats_hdr = (
                 f" {'Market':<28}"
-                f" {'UpVol':>8} {'UpAvg':>6} {'UpLast':>6} {'UpNet':>8}"
-                f" {'DnVol':>8} {'DnAvg':>6} {'DnLast':>6} {'DnNet':>8}"
-                f" {'Strike':>10}"
+                f" {'UpVol':>8} {'UpAvg':>6} {'UpNet':>8}"
+                f" {'DnVol':>8} {'DnAvg':>6} {'DnNet':>8}"
+                f" {'Strike':>10} {'BTC':>10}"
                 f" {'MinUp':>6} {'MaxUp':>6}"
                 f" {'MinBTC':>10} {'MaxBTC':>10}"
             )
@@ -1131,10 +1123,10 @@ def draw(stdscr, ob: OrderBook):
                 up_net_color = GREEN if st["up_net"] >= 0 else RED
                 dn_net_color = GREEN if st["down_net"] >= 0 else RED
                 base = f" {st['slug']:<28}"
-                up_part = f" {st['up_vol']:>8.1f} {st['up_avg']:>6.3f} {st['up_last']:>6.2f} {st['up_net']:>+8.2f}"
-                dn_part = f" {st['down_vol']:>8.1f} {st['down_avg']:>6.3f} {st['down_last']:>6.2f} {st['down_net']:>+8.2f}"
+                up_part = f" {st['up_vol']:>8.1f} {st['up_avg']:>6.3f} {st['up_net']:>+8.2f}"
+                dn_part = f" {st['down_vol']:>8.1f} {st['down_avg']:>6.3f} {st['down_net']:>+8.2f}"
                 price_part = (
-                    f" {st['strike']:>10,.2f}"
+                    f" {st['strike']:>10,.2f} {st['settle_btc']:>10,.2f}"
                     f" {st['min_up']:>6.2f} {st['max_up']:>6.2f}"
                     f" {st['min_btc']:>10,.2f} {st['max_btc']:>10,.2f}"
                 )
