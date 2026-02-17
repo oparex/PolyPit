@@ -1,4 +1,4 @@
-# PolyScope
+# PolyPit
 
 Real-time trading terminal for Polymarket BTC 5-minute binary options. Streams live order books via WebSocket, detects arbitrage opportunities, simulates paper trades, and computes Black-Scholes fair prices — all in a curses-based terminal UI.
 
