@@ -16,8 +16,9 @@ MAX_ROWS = 15
 MAX_TRADES = 200
 MAX_ARBS = 500
 MAX_PAPER_ROWS = 50
-PAPER_BUY_PRICE = 0.45
-PAPER_SELL_PRICE = 0.55
+PAPER_EDGE_THRESHOLD = 0.20  # min divergence from fair to enter
+PAPER_START_DELAY = 10       # seconds after market open before trading
+PAPER_STOP_BEFORE = 60       # seconds before expiry to stop entering
 PING_INTERVAL = 10
 VOL_WINDOW = 3600  # 60 minutes of price history for volatility & MC
 MC_SIMS = 10_000   # number of Monte Carlo paths
@@ -98,11 +99,12 @@ class OrderBook:
         self.mc_put: float = 0.5
         self._mc_last_run: float = 0.0
         self._mc_elapsed_ms: float = 0.0  # last MC computation time
-        # paper trading
-        # orders: {(outcome, side): {"price": float, "filled": bool, "fill_time": float}}
-        self._paper_orders: dict[tuple, dict] = {}
-        self._paper_min_up: float = float("inf")  # min normalized Up price seen
-        self._paper_max_up: float = 0.0            # max normalized Up price seen
+        # paper trading: two strategies (BS and MC), one trade per market each
+        # each entry: None or {"outcome", "side", "entry_price", "fair_price", "time"}
+        self._paper_trades: dict[str, dict | None] = {"BS": None, "MC": None}
+        self._paper_market_open_ts: float = 0.0
+        self._paper_min_up: float = float("inf")
+        self._paper_max_up: float = 0.0
         self._paper_min_btc: float = float("inf")
         self._paper_max_btc: float = 0.0
         # completed market results: list of dicts, newest first
@@ -118,7 +120,7 @@ class OrderBook:
                    names: list[str], expires_ts: int):
         with self.lock:
             # settle paper trades from previous market
-            if self._paper_orders:
+            if self.rotations > 0:
                 self._settle_paper()
             # save market stats from previous market
             if self.slug and self.rotations > 0:
@@ -145,9 +147,8 @@ class OrderBook:
                 start, p_up, p_down, cost, edge, size = self._active_arbs.pop(arb_type)
                 duration_ms = int((now - start) * 1000)
                 self.arbs.append((start, arb_type, p_up, p_down, cost, edge, size, duration_ms))
-            # init paper orders for new market (skip first market)
-            if self.rotations > 0:
-                self._init_paper_orders()
+            # init paper trading for new market (skip first market)
+            self._init_paper_trading()
         return old_ids
 
     def add_trade(self, asset_id: str, side: str, price: str, size: str, timestamp_ms: int):
@@ -320,111 +321,155 @@ class OrderBook:
         self.mc_put = 1.0 - self.mc_call
         self._mc_elapsed_ms = (time.perf_counter() - t0) * 1000
 
-    def _init_paper_orders(self):
-        """Place paper orders for the new market. Called with lock held."""
-        self._paper_orders = {
-            ("Up", "BUY"):  {"price": PAPER_BUY_PRICE, "filled": False, "fill_time": 0.0},
-            ("Up", "SELL"): {"price": PAPER_SELL_PRICE, "filled": False, "fill_time": 0.0},
-            ("Down", "BUY"):  {"price": PAPER_BUY_PRICE, "filled": False, "fill_time": 0.0},
-            ("Down", "SELL"): {"price": PAPER_SELL_PRICE, "filled": False, "fill_time": 0.0},
-        }
+    def _init_paper_trading(self):
+        """Reset paper trading state for a new market. Called with lock held."""
+        self._paper_trades = {"BS": None, "MC": None}
+        self._paper_market_open_ts = time.time()
         self._paper_min_up = float("inf")
         self._paper_max_up = 0.0
         self._paper_min_btc = float("inf")
         self._paper_max_btc = 0.0
 
-    def _check_paper_fills(self):
-        """Check if any paper orders are filled. Called with lock held."""
+    def _get_market_mids(self) -> dict[str, float]:
+        """Return mid prices for Up and Down from current books. Called with lock held."""
+        if len(self.asset_ids) < 2:
+            return {}
+        mids = {}
+        for outcome, aid in [("Up", self.asset_ids[0]), ("Down", self.asset_ids[1])]:
+            if aid in self.books:
+                book = self.books[aid]
+                if book["bids"] and book["asks"]:
+                    bb = float(max(book["bids"].keys(), key=lambda p: float(p)))
+                    ba = float(min(book["asks"].keys(), key=lambda p: float(p)))
+                    mids[outcome] = (bb + ba) / 2
+        return mids
+
+    def _try_enter_trade(self, strategy: str, fair_up: float, fair_down: float):
+        """Try to enter a paper trade for the given strategy. Called with lock held."""
+        if self._paper_trades[strategy] is not None:
+            return  # already traded this market
+
+        now = time.time()
+        # time window check
+        elapsed = now - self._paper_market_open_ts
+        remaining = self.expires_ts - now
+        if elapsed < PAPER_START_DELAY or remaining < PAPER_STOP_BEFORE:
+            return
+
         if len(self.asset_ids) < 2:
             return
         aid_up, aid_down = self.asset_ids[0], self.asset_ids[1]
 
-        for outcome, aid in [("Up", aid_up), ("Down", aid_down)]:
-            if aid not in self.books:
-                continue
-            book = self.books[aid]
-            now = time.time()
+        mids = self._get_market_mids()
+        if "Up" not in mids or "Down" not in mids:
+            return
 
-            # check BUY order: filled if best ask <= our buy price
-            buy_order = self._paper_orders.get((outcome, "BUY"))
-            if buy_order and not buy_order["filled"] and book["asks"]:
-                best_ask = min(book["asks"].keys(), key=lambda p: float(p))
-                if float(best_ask) <= buy_order["price"]:
-                    buy_order["filled"] = True
-                    buy_order["fill_time"] = now
+        # compute divergence for each outcome
+        up_diff = mids["Up"] - fair_up      # positive = market overpriced vs fair
+        down_diff = mids["Down"] - fair_down
 
-            # check SELL order: filled if best bid >= our sell price
-            sell_order = self._paper_orders.get((outcome, "SELL"))
-            if sell_order and not sell_order["filled"] and book["bids"]:
-                best_bid = max(book["bids"].keys(), key=lambda p: float(p))
-                if float(best_bid) >= sell_order["price"]:
-                    sell_order["filled"] = True
-                    sell_order["fill_time"] = now
+        up_abs = abs(up_diff)
+        down_abs = abs(down_diff)
 
-        # track min/max normalized Up price (Up best mid, and 1-Down best mid)
-        if aid_up in self.books:
-            book = self.books[aid_up]
-            if book["bids"] and book["asks"]:
-                bb = float(max(book["bids"].keys(), key=lambda p: float(p)))
-                ba = float(min(book["asks"].keys(), key=lambda p: float(p)))
-                mid = (bb + ba) / 2
-                self._paper_min_up = min(self._paper_min_up, mid)
-                self._paper_max_up = max(self._paper_max_up, mid)
+        # pick the side with bigger divergence
+        if up_abs >= down_abs and up_abs > PAPER_EDGE_THRESHOLD:
+            outcome = "Up"
+            aid = aid_up
+            diff = up_diff
+            fair = fair_up
+        elif down_abs > PAPER_EDGE_THRESHOLD:
+            outcome = "Down"
+            aid = aid_down
+            diff = down_diff
+            fair = fair_down
+        else:
+            return  # no sufficient divergence
 
-        if aid_down in self.books:
-            book = self.books[aid_down]
-            if book["bids"] and book["asks"]:
-                bb = float(max(book["bids"].keys(), key=lambda p: float(p)))
-                ba = float(min(book["asks"].keys(), key=lambda p: float(p)))
-                mid_down = (bb + ba) / 2
-                norm = 1.0 - mid_down
-                self._paper_min_up = min(self._paper_min_up, norm)
-                self._paper_max_up = max(self._paper_max_up, norm)
+        book = self.books.get(aid, {})
+        if diff > 0:
+            # market overpriced → SELL at best bid
+            if not book.get("bids"):
+                return
+            best_bid = max(book["bids"].keys(), key=lambda p: float(p))
+            entry_price = float(best_bid)
+            side = "SELL"
+        else:
+            # market underpriced → BUY at best ask
+            if not book.get("asks"):
+                return
+            best_ask = min(book["asks"].keys(), key=lambda p: float(p))
+            entry_price = float(best_ask)
+            side = "BUY"
 
-        # track min/max BTC price
+        self._paper_trades[strategy] = {
+            "outcome": outcome,
+            "side": side,
+            "entry_price": entry_price,
+            "fair_price": fair,
+            "market_mid": mids[outcome],
+            "time": now,
+        }
+
+    def _check_paper_fills(self):
+        """Check paper trading signals and track min/max. Called with lock held."""
+        if len(self.asset_ids) < 2 or self.rotations == 0:
+            return
+
+        # try to enter trades for each strategy
+        if self.volatility > 0:
+            self._try_enter_trade("BS", self.bs_call, self.bs_put)
+        if self._mc_elapsed_ms > 0:
+            self._try_enter_trade("MC", self.mc_call, self.mc_put)
+
+        # track min/max
+        aid_up, aid_down = self.asset_ids[0], self.asset_ids[1]
+        mids = self._get_market_mids()
+        if "Up" in mids:
+            self._paper_min_up = min(self._paper_min_up, mids["Up"])
+            self._paper_max_up = max(self._paper_max_up, mids["Up"])
+        if "Down" in mids:
+            norm = 1.0 - mids["Down"]
+            self._paper_min_up = min(self._paper_min_up, norm)
+            self._paper_max_up = max(self._paper_max_up, norm)
         if self.btc_price > 0:
             self._paper_min_btc = min(self._paper_min_btc, self.btc_price)
             self._paper_max_btc = max(self._paper_max_btc, self.btc_price)
 
     def _settle_paper(self):
-        """Settle paper orders for the ended market. Called with lock held."""
-        if not self._paper_orders or self.strike_price == 0 or self.btc_price == 0:
+        """Settle paper trades for the ended market. Called with lock held."""
+        if self.strike_price == 0 or self.btc_price == 0:
             return
 
         up_won = self.btc_price >= self.strike_price
 
-        num_fills = 0
-        profit = 0.0
+        for strategy in ("BS", "MC"):
+            trade = self._paper_trades[strategy]
+            profit = 0.0
+            traded = trade is not None
 
-        for (outcome, side), order in self._paper_orders.items():
-            if not order["filled"]:
-                continue
-            num_fills += 1
-            outcome_won = (outcome == "Up" and up_won) or (outcome == "Down" and not up_won)
+            if traded:
+                outcome_won = (trade["outcome"] == "Up" and up_won) or \
+                              (trade["outcome"] == "Down" and not up_won)
+                if trade["side"] == "BUY":
+                    profit = (1.0 if outcome_won else 0.0) - trade["entry_price"]
+                else:  # SELL
+                    profit = trade["entry_price"] - (1.0 if outcome_won else 0.0)
 
-            if side == "BUY":
-                # we paid order["price"], get $1 if right, $0 if wrong
-                if outcome_won:
-                    profit += 1.0 - order["price"]
-                else:
-                    profit += 0.0 - order["price"]
-            else:  # SELL
-                # we received order["price"], pay $0 if right, $1 if wrong
-                if outcome_won:
-                    # we sold a winner — we pay $1
-                    profit += order["price"] - 1.0
-                else:
-                    # we sold a loser — we pay $0
-                    profit += order["price"]
+            result = {
+                "slug": self.slug,
+                "strategy": strategy,
+                "traded": traded,
+                "outcome": trade["outcome"] if traded else "-",
+                "side": trade["side"] if traded else "-",
+                "entry": trade["entry_price"] if traded else 0.0,
+                "fair": trade["fair_price"] if traded else 0.0,
+                "profit": profit,
+                "up_won": up_won,
+            }
+            self.paper_results.insert(0, result)
 
-        result = {
-            "slug": self.slug,
-            "fills": num_fills,
-            "profit": profit,
-            "up_won": up_won,
-        }
-        self.paper_results.insert(0, result)
-        if len(self.paper_results) > MAX_PAPER_ROWS:
+        # trim
+        while len(self.paper_results) > MAX_PAPER_ROWS * 2:
             self.paper_results.pop()
 
     def get_paper_results(self) -> list[dict]:
@@ -1082,23 +1127,22 @@ def draw(stdscr, ob: OrderBook):
                         pass
 
         # -- paper trading table (below the orderbook, left side) --
-        PAPER_W = 68  # width of paper trading panel
+        PAPER_W = 90  # width of paper trading panel
         paper_row = book_end_row + 1
         if paper_row < h - 3:
             # current market paper status
-            paper_orders = None
             with ob.lock:
-                paper_orders = dict(ob._paper_orders)
-            filled_count = sum(1 for o in paper_orders.values() if o["filled"])
-            pending_count = sum(1 for o in paper_orders.values() if not o["filled"])
-            paper_status = f" Paper: {filled_count} filled, {pending_count} pending"
-            fills_detail = ""
-            for (outcome, side), o in sorted(paper_orders.items()):
-                marker = "\u2713" if o["filled"] else "\u00b7"
-                fills_detail += f"  {marker}{outcome[0]}{side[0]}@{o['price']:.2f}"
+                paper_trades = dict(ob._paper_trades)
+            status_parts = []
+            for strat in ("BS", "MC"):
+                t = paper_trades[strat]
+                if t is None:
+                    status_parts.append(f"{strat}: waiting")
+                else:
+                    status_parts.append(f"{strat}: {t['side']} {t['outcome']}@{t['entry_price']:.2f} (fair={t['fair_price']:.2f})")
+            paper_status = f" Paper: {' | '.join(status_parts)}"
             try:
                 stdscr.addnstr(paper_row, 1, paper_status, PAPER_W, CYAN | BOLD)
-                stdscr.addnstr(paper_row, len(paper_status) + 1, fills_detail, PAPER_W - len(paper_status), DIM)
             except curses.error:
                 pass
             paper_row += 1
@@ -1108,7 +1152,9 @@ def draw(stdscr, ob: OrderBook):
             # header
             hdr = (
                 f" {'Market':<28}"
-                f" {'Fills':>5}"
+                f" {'Strat':>5}"
+                f" {'Side':>4} {'Out':>4}"
+                f" {'Entry':>6} {'Fair':>6}"
                 f" {'P&L':>7}"
                 f" {'Result':>6}"
             )
@@ -1123,33 +1169,60 @@ def draw(stdscr, ob: OrderBook):
                 pass
             paper_row += 1
 
-            cumulative_pnl = sum(r["profit"] for r in results)
+            bs_pnl = sum(r["profit"] for r in results if r["strategy"] == "BS")
+            mc_pnl = sum(r["profit"] for r in results if r["strategy"] == "MC")
 
             for res in results:
                 if paper_row >= h - 2:
                     break
                 result_str = "UP" if res["up_won"] else "DN"
                 result_color = GREEN if res["up_won"] else RED
-                pnl_color = GREEN if res["profit"] >= 0 else RED
-                line = (
-                    f" {res['slug']:<28}"
-                    f" {res['fills']:>5}"
-                    f" {res['profit']:>+7.2f}"
-                )
-                result_part = f" {result_str:>6}"
-                try:
-                    stdscr.addnstr(paper_row, 1, line, len(line), pnl_color)
-                    stdscr.addnstr(paper_row, 1 + len(line), result_part, len(result_part), result_color | BOLD)
-                except curses.error:
-                    pass
+                pnl_color = GREEN if res["profit"] > 0 else RED if res["profit"] < 0 else DIM
+                if not res["traded"]:
+                    line = (
+                        f" {res['slug']:<28}"
+                        f" {res['strategy']:>5}"
+                        f" {'--':>4} {'--':>4}"
+                        f" {'--':>6} {'--':>6}"
+                        f" {'0.00':>7}"
+                    )
+                    result_part = f" {result_str:>6}"
+                    try:
+                        stdscr.addnstr(paper_row, 1, line, len(line), DIM)
+                        stdscr.addnstr(paper_row, 1 + len(line), result_part, len(result_part), result_color)
+                    except curses.error:
+                        pass
+                else:
+                    line = (
+                        f" {res['slug']:<28}"
+                        f" {res['strategy']:>5}"
+                        f" {res['side']:>4} {res['outcome']:>4}"
+                        f" {res['entry']:>6.2f} {res['fair']:>6.2f}"
+                        f" {res['profit']:>+7.2f}"
+                    )
+                    result_part = f" {result_str:>6}"
+                    try:
+                        stdscr.addnstr(paper_row, 1, line, len(line), pnl_color)
+                        stdscr.addnstr(paper_row, 1 + len(line), result_part, len(result_part), result_color | BOLD)
+                    except curses.error:
+                        pass
                 paper_row += 1
 
-            # cumulative P&L
+            # per-strategy cumulative P&L
             if paper_row < h - 1:
-                cum_color = GREEN | BOLD if cumulative_pnl >= 0 else RED | BOLD
-                cum_str = f" Cumulative P&L: {cumulative_pnl:+.2f}  ({len(results)} markets)"
+                bs_color = GREEN | BOLD if bs_pnl >= 0 else RED | BOLD
+                mc_color = GREEN | BOLD if mc_pnl >= 0 else RED | BOLD
+                n_markets = len(results) // 2
+                cum_str = f" BS P&L: {bs_pnl:+.2f}"
+                mc_str = f"  MC P&L: {mc_pnl:+.2f}"
+                count_str = f"  ({n_markets} markets)"
                 try:
-                    stdscr.addnstr(paper_row, 1, cum_str, PAPER_W, cum_color)
+                    cx = 1
+                    stdscr.addnstr(paper_row, cx, cum_str, len(cum_str), bs_color)
+                    cx += len(cum_str)
+                    stdscr.addnstr(paper_row, cx, mc_str, len(mc_str), mc_color)
+                    cx += len(mc_str)
+                    stdscr.addnstr(paper_row, cx, count_str, len(count_str), DIM)
                 except curses.error:
                     pass
 
