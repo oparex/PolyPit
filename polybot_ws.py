@@ -99,6 +99,7 @@ class OrderBook:
         self.mc_put: float = 0.5
         self._mc_last_run: float = 0.0
         self._mc_elapsed_ms: float = 0.0  # last MC computation time
+        self._mc_market_runs: int = 0     # MC runs since current market opened
         # paper trading: two strategies (BS and MC), one trade per market each
         # each entry: None or {"outcome", "side", "entry_price", "fair_price", "time"}
         self._paper_trades: dict[str, dict | None] = {"BS": None, "MC": None}
@@ -294,6 +295,10 @@ class OrderBook:
         if now - self._mc_last_run >= MC_INTERVAL and len(log_returns) >= 10:
             self._run_monte_carlo(log_returns, avg_dt)
             self._mc_last_run = now
+            self._mc_market_runs += 1
+            # try MC paper trade immediately after fresh calculation
+            if self._mc_market_runs >= 3 and self.rotations > 0:
+                self._try_enter_trade("MC", self.mc_call, self.mc_put)
 
     def _run_monte_carlo(self, log_returns: list[float], avg_dt: float):
         """Bootstrap Monte Carlo: sample observed returns to simulate paths to expiry. Called with lock held."""
@@ -325,6 +330,7 @@ class OrderBook:
         """Reset paper trading state for a new market. Called with lock held."""
         self._paper_trades = {"BS": None, "MC": None}
         self._paper_market_open_ts = time.time()
+        self._mc_market_runs = 0
         self._paper_min_up = float("inf")
         self._paper_max_up = 0.0
         self._paper_min_btc = float("inf")
@@ -350,6 +356,9 @@ class OrderBook:
             return  # already traded this market
 
         now = time.time()
+        # need at least 5 min of price history for meaningful fair values
+        if self._price_history and (now - self._price_history[0][0]) < 300:
+            return
         # time window check
         elapsed = now - self._paper_market_open_ts
         remaining = self.expires_ts - now
@@ -418,8 +427,7 @@ class OrderBook:
         # try to enter trades for each strategy
         if self.volatility > 0:
             self._try_enter_trade("BS", self.bs_call, self.bs_put)
-        if self._mc_elapsed_ms > 0:
-            self._try_enter_trade("MC", self.mc_call, self.mc_put)
+        # MC trades are triggered from record_price() right after MC recalculation
 
         # track min/max
         aid_up, aid_down = self.asset_ids[0], self.asset_ids[1]
