@@ -35,23 +35,14 @@ def fetch_market(slug):
     return resp.json()
 
 
-def fetch_btc_price():
-    try:
-        r = requests.get("https://api.binance.com/api/v3/ticker/price",
-                         params={"symbol": "BTCUSDT"}, timeout=5)
-        return float(r.json()["price"])
-    except Exception:
-        return 0.0
-
-
 def fetch_btc_price_at(ts):
     try:
-        r = requests.get("https://api.binance.com/api/v3/klines", params={
-            "symbol": "BTCUSDT", "interval": "1m", "startTime": ts * 1000, "limit": 1,
+        r = requests.get("https://www.bitstamp.net/api/v2/ohlc/btcusd/", params={
+            "step": 60, "start": ts, "limit": 1,
         }, timeout=5)
-        kline = r.json()
-        if kline:
-            return float(kline[0][1])
+        data = r.json().get("data", {}).get("ohlc", [])
+        if data:
+            return float(data[0]["open"])
     except Exception:
         pass
     return 0.0
@@ -239,13 +230,43 @@ def run_rotation(rec: ArbRecorder):
             swap_subscription(rec, old_ids, tokens)
 
 
+def fetch_btc_price() -> float:
+    try:
+        r = requests.get("https://www.bitstamp.net/api/v2/ticker/btcusd/", timeout=5)
+        return float(r.json()["last"])
+    except Exception:
+        return 0.0
+
+
 def run_btc_price(rec: ArbRecorder):
-    while True:
-        price = fetch_btc_price()
-        if price > 0:
+    price = fetch_btc_price()
+    if price > 0:
+        with rec.lock:
+            rec.btc_price = price
+
+    def on_open(ws):
+        ws.send(json.dumps({
+            "event": "bts:subscribe",
+            "data": {"channel": "live_trades_btcusd"},
+        }))
+
+    def on_message(ws, message):
+        data = json.loads(message)
+        if data.get("event") == "trade":
+            price = float(data["data"]["price"])
             with rec.lock:
                 rec.btc_price = price
-        time.sleep(1)
+
+    while True:
+        ws_app = websocket.WebSocketApp(
+            "wss://ws.bitstamp.net",
+            on_open=on_open,
+            on_message=on_message,
+            on_error=lambda ws, e: None,
+            on_close=lambda ws, c, m: None,
+        )
+        ws_app.run_forever()
+        time.sleep(2)
 
 
 def run_ws(rec: ArbRecorder):

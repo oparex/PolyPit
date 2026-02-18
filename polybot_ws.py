@@ -592,42 +592,70 @@ class OrderBook:
             )
 
 
-def fetch_btc_price() -> float:
-    """Fetch current BTC/USDT price from Binance."""
-    try:
-        r = requests.get("https://api.binance.com/api/v3/ticker/price",
-                         params={"symbol": "BTCUSDT"}, timeout=5)
-        return float(r.json()["price"])
-    except Exception:
-        return 0.0
-
-
 def fetch_btc_price_at(ts: int) -> float:
-    """Fetch BTC open price at a given unix timestamp from Binance klines."""
+    """Fetch BTC price at a given unix timestamp from Bitstamp OHLC."""
     try:
-        r = requests.get("https://api.binance.com/api/v3/klines", params={
-            "symbol": "BTCUSDT",
-            "interval": "1m",
-            "startTime": ts * 1000,
+        r = requests.get("https://www.bitstamp.net/api/v2/ohlc/btcusd/", params={
+            "step": 60,
+            "start": ts,
             "limit": 1,
         }, timeout=5)
-        kline = r.json()
-        if kline:
-            return float(kline[0][1])  # open price
+        data = r.json().get("data", {}).get("ohlc", [])
+        if data:
+            return float(data[0]["open"])
     except Exception:
         pass
     return 0.0
 
 
+def fetch_btc_price() -> float:
+    """Fetch current BTC/USD price from Bitstamp REST (used for initial seed)."""
+    try:
+        r = requests.get("https://www.bitstamp.net/api/v2/ticker/btcusd/", timeout=5)
+        return float(r.json()["last"])
+    except Exception:
+        return 0.0
+
+
 def run_btc_price(ob: OrderBook):
-    """Background thread that polls current BTC price every second."""
-    while True:
-        price = fetch_btc_price()
-        if price > 0:
+    """Background thread that streams BTC/USD price from Bitstamp WebSocket."""
+    # seed initial price via REST so the app doesn't wait for first WS trade
+    price = fetch_btc_price()
+    if price > 0:
+        with ob.lock:
+            ob.btc_price = price
+            ob.record_price(price)
+
+    def on_open(ws):
+        ws.send(json.dumps({
+            "event": "bts:subscribe",
+            "data": {"channel": "live_trades_btcusd"},
+        }))
+
+    def on_message(ws, message):
+        data = json.loads(message)
+        if data.get("event") == "trade":
+            price = float(data["data"]["price"])
             with ob.lock:
                 ob.btc_price = price
                 ob.record_price(price)
-        time.sleep(1)
+
+    def on_error(ws, error):
+        pass
+
+    def on_close(ws, code, msg):
+        pass
+
+    while True:
+        ws_app = websocket.WebSocketApp(
+            "wss://ws.bitstamp.net",
+            on_open=on_open,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
+        )
+        ws_app.run_forever()
+        time.sleep(2)
 
 
 def swap_subscription(ob: OrderBook, old_ids: list[str], new_ids: list[str]):
@@ -1310,7 +1338,7 @@ def main():
     # start rotation thread
     threading.Thread(target=run_rotation, args=(ob,), daemon=True).start()
 
-    # start BTC price polling thread
+    # start BTC price WebSocket thread
     threading.Thread(target=run_btc_price, args=(ob,), daemon=True).start()
 
     curses.wrapper(lambda stdscr: draw(stdscr, ob))
