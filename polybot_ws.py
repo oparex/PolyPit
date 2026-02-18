@@ -12,7 +12,7 @@ import websocket
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-MAX_ROWS = 15
+MAX_ROWS = 8
 MAX_TRADES = 200
 MAX_ARBS = 500
 MAX_PAPER_ROWS = 50
@@ -194,7 +194,12 @@ class OrderBook:
                 self.arbs = self.arbs[-MAX_ARBS:]
 
     def check_arbs(self):
-        """Check for arb opportunities across Up/Down books. Called with lock held."""
+        """Check for arb opportunities across Up/Down books. Called with lock held.
+
+        In binary markets, bids on one side mirror asks on the other
+        (bid_up at P = ask_down at 1-P, same size). So BUY and SELL arbs
+        are always identical — we only check asks (buy both < $1).
+        """
         if len(self.asset_ids) < 2:
             return
         aid_up = self.asset_ids[0]
@@ -203,49 +208,25 @@ class OrderBook:
             return
 
         now = time.time()
-        book_up = self.books[aid_up]
-        book_down = self.books[aid_down]
+        asks_up = self.books[aid_up]["asks"]
+        asks_down = self.books[aid_down]["asks"]
 
-        # BUY arb: buy best ask Up + buy best ask Down < 1.0
-        buy_arb = False
-        asks_up = book_up["asks"]
-        asks_down = book_down["asks"]
+        arb_found = False
         if asks_up and asks_down:
             best_ask_up = min(asks_up.keys(), key=lambda p: float(p))
             best_ask_down = min(asks_down.keys(), key=lambda p: float(p))
             cost = float(best_ask_up) + float(best_ask_down)
             if cost < 1.0:
-                buy_arb = True
+                arb_found = True
                 edge = 1.0 - cost
                 size = min(float(asks_up[best_ask_up]), float(asks_down[best_ask_down]))
                 if "BUY" not in self._active_arbs:
                     self._active_arbs["BUY"] = (now, best_ask_up, best_ask_down, cost, edge, size)
                 else:
-                    # update size/edge but keep original start time
-                    start = self._active_arbs["BUY"][0]
-                    self._active_arbs["BUY"] = (start, best_ask_up, best_ask_down, cost, edge, size)
-        if not buy_arb:
+                    start, orig_up, orig_down, orig_cost, orig_edge, _ = self._active_arbs["BUY"]
+                    self._active_arbs["BUY"] = (start, orig_up, orig_down, orig_cost, orig_edge, size)
+        if not arb_found:
             self._close_arb("BUY", now)
-
-        # SELL arb: sell best bid Up + sell best bid Down > 1.0
-        sell_arb = False
-        bids_up = book_up["bids"]
-        bids_down = book_down["bids"]
-        if bids_up and bids_down:
-            best_bid_up = max(bids_up.keys(), key=lambda p: float(p))
-            best_bid_down = max(bids_down.keys(), key=lambda p: float(p))
-            proceeds = float(best_bid_up) + float(best_bid_down)
-            if proceeds > 1.0:
-                sell_arb = True
-                edge = proceeds - 1.0
-                size = min(float(bids_up[best_bid_up]), float(bids_down[best_bid_down]))
-                if "SELL" not in self._active_arbs:
-                    self._active_arbs["SELL"] = (now, best_bid_up, best_bid_down, proceeds, edge, size)
-                else:
-                    start = self._active_arbs["SELL"][0]
-                    self._active_arbs["SELL"] = (start, best_bid_up, best_bid_down, proceeds, edge, size)
-        if not sell_arb:
-            self._close_arb("SELL", now)
 
     def record_price(self, price: float):
         """Record a BTC price observation and update volatility + BS prices. Called with lock held."""
@@ -533,7 +514,7 @@ class OrderBook:
             now = time.time()
             # active arbs shown first with live duration
             active = []
-            for arb_type in ("BUY", "SELL"):
+            for arb_type in ("BUY",):
                 if arb_type in self._active_arbs:
                     start, p_up, p_down, cost, edge, size = self._active_arbs[arb_type]
                     dur = int((now - start) * 1000)
@@ -570,13 +551,25 @@ class OrderBook:
             self._check_paper_fills()
 
     def get_levels(self, asset_id: str):
+        """Return (bids, asks) with cumulative sizes. Bids high-to-low, asks low-to-high."""
         with self.lock:
             if asset_id not in self.books:
                 return [], []
             book = self.books[asset_id]
             bids = sorted(book["bids"].items(), key=lambda x: float(x[0]), reverse=True)[:MAX_ROWS]
             asks = sorted(book["asks"].items(), key=lambda x: float(x[0]))[:MAX_ROWS]
-            return bids, asks
+            # cumulative sizes: from best level outward
+            cum = 0.0
+            cum_bids = []
+            for price, size in bids:
+                cum += float(size)
+                cum_bids.append((price, str(cum)))
+            cum = 0.0
+            cum_asks = []
+            for price, size in asks:
+                cum += float(size)
+                cum_asks.append((price, str(cum)))
+            return cum_bids, cum_asks
 
     def get_snapshot(self):
         with self.lock:
@@ -917,7 +910,7 @@ def draw(stdscr, ob: OrderBook):
             stdscr.addnstr(row, chart_x + bar_max, f"{'':^{price_w}}", price_w, DIM)
             stdscr.addnstr(row, chart_x + bar_max + price_w, dn_hdr, bar_max, RED | DIM)
         if show_arbs:
-            stdscr.addnstr(row, arb_x, "  TIME         TYPE  EDGE   SIZE  DUR     Up/Dn", ARB_W, DIM)
+            stdscr.addnstr(row, arb_x, "  TIME          EDGE    SIZE  DUR     Up/Dn", ARB_W, DIM)
         row += 1
 
         # get levels
@@ -1112,7 +1105,6 @@ def draw(stdscr, ob: OrderBook):
                     dt = datetime.fromtimestamp(ts_f, tz=timezone.utc)
                     ms = int((ts_f % 1) * 1000)
                     t_str = dt.strftime("%H:%M:%S") + f".{ms:03d}"
-                    type_str = "BUY " if arb_type == "BUY" else "SELL"
                     # format duration
                     if dur_ms < 1000:
                         dur_str = f"{dur_ms}ms"
@@ -1123,9 +1115,9 @@ def draw(stdscr, ob: OrderBook):
                     color = (GREEN | BOLD) if is_active else GREEN
                     marker = "\u25cf" if is_active else " "
                     line = (
-                        f" {marker}{t_str}  {type_str}"
-                        f" {edge:>5.2f}"
-                        f" {size:>6.1f}"
+                        f" {marker}{t_str}"
+                        f" {edge:>6.2f}"
+                        f" {size:>7.1f}"
                         f" {dur_str:>6}"
                         f"  {p_up}/{p_down}"
                     )
@@ -1177,8 +1169,12 @@ def draw(stdscr, ob: OrderBook):
                 pass
             paper_row += 1
 
-            bs_pnl = sum(r["profit"] for r in results if r["strategy"] == "BS")
-            mc_pnl = sum(r["profit"] for r in results if r["strategy"] == "MC")
+            bs_results = [r for r in results if r["strategy"] == "BS"]
+            mc_results = [r for r in results if r["strategy"] == "MC"]
+            bs_pnl = sum(r["profit"] for r in bs_results)
+            mc_pnl = sum(r["profit"] for r in mc_results)
+            bs_trades = sum(1 for r in bs_results if r["traded"])
+            mc_trades = sum(1 for r in mc_results if r["traded"])
 
             for res in results:
                 if paper_row >= h - 2:
@@ -1221,9 +1217,9 @@ def draw(stdscr, ob: OrderBook):
                 bs_color = GREEN | BOLD if bs_pnl >= 0 else RED | BOLD
                 mc_color = GREEN | BOLD if mc_pnl >= 0 else RED | BOLD
                 n_markets = len(results) // 2
-                cum_str = f" BS P&L: {bs_pnl:+.2f}"
-                mc_str = f"  MC P&L: {mc_pnl:+.2f}"
-                count_str = f"  ({n_markets} markets)"
+                cum_str = f" BS: {bs_pnl:+.2f} ({bs_trades}/{n_markets})"
+                mc_str = f"  MC: {mc_pnl:+.2f} ({mc_trades}/{n_markets})"
+                count_str = f"  [{n_markets} markets]"
                 try:
                     cx = 1
                     stdscr.addnstr(paper_row, cx, cum_str, len(cum_str), bs_color)
@@ -1245,7 +1241,6 @@ def draw(stdscr, ob: OrderBook):
                 f" {'DnVol':>8} {'DnAvg':>6} {'DnNet':>8}"
                 f" {'Strike':>10} {'BTC':>10}"
                 f" {'MinUp':>6} {'MaxUp':>6}"
-                f" {'MinBTC':>10} {'MaxBTC':>10}"
             )
             try:
                 stdscr.addnstr(stats_row, STATS_X, " Market Statistics", w - STATS_X - 1, CYAN | BOLD)
@@ -1276,7 +1271,6 @@ def draw(stdscr, ob: OrderBook):
                 price_part = (
                     f" {st['strike']:>10,.2f} {st['settle_btc']:>10,.2f}"
                     f" {st['min_up']:>6.2f} {st['max_up']:>6.2f}"
-                    f" {st['min_btc']:>10,.2f} {st['max_btc']:>10,.2f}"
                 )
                 try:
                     cx = STATS_X

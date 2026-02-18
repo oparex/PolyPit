@@ -117,6 +117,8 @@ class ArbRecorder:
             self.write_arb(start, arb_type, p_up, p_down, cost, edge, size, duration_ms)
 
     def check_arbs(self):
+        """In binary markets, bids mirror asks (bid_up = 1 - ask_down).
+        BUY and SELL arbs are always identical, so we only check asks."""
         if len(self.asset_ids) < 2:
             return
         aid_up, aid_down = self.asset_ids[0], self.asset_ids[1]
@@ -124,46 +126,25 @@ class ArbRecorder:
             return
 
         now = time.time()
-        book_up = self.books[aid_up]
-        book_down = self.books[aid_down]
+        asks_up = self.books[aid_up]["asks"]
+        asks_down = self.books[aid_down]["asks"]
 
-        # BUY arb
-        buy_arb = False
-        asks_up, asks_down = book_up["asks"], book_down["asks"]
+        arb_found = False
         if asks_up and asks_down:
             best_ask_up = min(asks_up, key=lambda p: float(p))
             best_ask_down = min(asks_down, key=lambda p: float(p))
             cost = float(best_ask_up) + float(best_ask_down)
             if cost < 1.0:
-                buy_arb = True
+                arb_found = True
                 edge = 1.0 - cost
                 size = min(float(asks_up[best_ask_up]), float(asks_down[best_ask_down]))
                 if "BUY" not in self._active_arbs:
                     self._active_arbs["BUY"] = (now, best_ask_up, best_ask_down, cost, edge, size)
                 else:
-                    start = self._active_arbs["BUY"][0]
-                    self._active_arbs["BUY"] = (start, best_ask_up, best_ask_down, cost, edge, size)
-        if not buy_arb:
+                    start, orig_up, orig_down, orig_cost, orig_edge, _ = self._active_arbs["BUY"]
+                    self._active_arbs["BUY"] = (start, orig_up, orig_down, orig_cost, orig_edge, size)
+        if not arb_found:
             self._close_arb("BUY", now)
-
-        # SELL arb
-        sell_arb = False
-        bids_up, bids_down = book_up["bids"], book_down["bids"]
-        if bids_up and bids_down:
-            best_bid_up = max(bids_up, key=lambda p: float(p))
-            best_bid_down = max(bids_down, key=lambda p: float(p))
-            proceeds = float(best_bid_up) + float(best_bid_down)
-            if proceeds > 1.0:
-                sell_arb = True
-                edge = proceeds - 1.0
-                size = min(float(bids_up[best_bid_up]), float(bids_down[best_bid_down]))
-                if "SELL" not in self._active_arbs:
-                    self._active_arbs["SELL"] = (now, best_bid_up, best_bid_down, proceeds, edge, size)
-                else:
-                    start = self._active_arbs["SELL"][0]
-                    self._active_arbs["SELL"] = (start, best_bid_up, best_bid_down, proceeds, edge, size)
-        if not sell_arb:
-            self._close_arb("SELL", now)
 
     def set_snapshot(self, asset_id, bids, asks):
         with self.lock:
