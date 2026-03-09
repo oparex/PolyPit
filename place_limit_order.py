@@ -1,8 +1,8 @@
 """
-place_order.py — Place a GTC limit order on the current BTC 5-minute Up/Down market.
+place_limit_order.py — Place a GTC limit order on the current BTC 5-minute Up/Down market.
 
 Usage:
-    ./venv/bin/python place_order.py
+    ./venv/bin/python place_limit_order.py
 
 Requires:
     pip install py-clob-client
@@ -25,7 +25,7 @@ CHAIN_ID = 137  # Polygon mainnet
 
 
 # ---------------------------------------------------------------------------
-# Market slug + market fetch (same logic as polybot_ws.py)
+# Market slug + market fetch
 # ---------------------------------------------------------------------------
 
 def get_current_5min_timestamp() -> int:
@@ -160,7 +160,7 @@ def main():
     # 4. Init CLOB client
     try:
         from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import MarketOrderArgs, OrderType, BalanceAllowanceParams, AssetType
+        from py_clob_client.clob_types import OrderArgs, OrderType, BalanceAllowanceParams, AssetType
     except ImportError:
         print("[error] py-clob-client not installed. Run:")
         print("  ./venv/bin/pip install py-clob-client")
@@ -168,7 +168,7 @@ def main():
 
     key, funder = get_creds()
 
-    print("\nInitialising CLOB client (signature_type=1)...")
+    print("\nInitialising CLOB client...")
     client = ClobClient(
         host=CLOB_API,
         chain_id=CHAIN_ID,
@@ -225,37 +225,52 @@ def main():
         print("  Enter BUY or SELL.")
 
     while True:
-        amount_raw = input("Amount (USDC): ").strip()
+        size_raw = input("Size (shares): ").strip()
         try:
-            amount = float(amount_raw)
-            if amount > 0:
+            size = float(size_raw)
+            if size > 0:
                 break
         except ValueError:
             pass
         print("  Enter a positive number.")
 
+    bid, ask = best_bid_ask(books[idx])
+    suggested = ask if side == "BUY" else bid
+    suggested_str = f" [{suggested:.4f}]" if suggested is not None else ""
+    while True:
+        price_raw = input(f"Limit price (0.01 – 0.99){suggested_str}: ").strip()
+        try:
+            limit_price = float(price_raw)
+            if 0.01 <= limit_price <= 0.99:
+                break
+        except ValueError:
+            pass
+        print("  Enter a price between 0.01 and 0.99.")
+
     # Confirm
     print(f"\n  Outcome    : {outcome_name}")
     print(f"  Token ID   : {token_id}")
     print(f"  Side       : {side}")
-    print(f"  Amount     : ${amount:.2f}")
-    print(f"  Order type : FAK (fill-and-kill)")
+    print(f"  Size       : {size} shares")
+    print(f"  Limit price: {limit_price:.4f}")
+    print(f"  Order type : GTC (good-till-cancelled)")
     confirm = input("\nSend order? [y/N]: ").strip().lower()
     if confirm != "y":
         print("Cancelled.")
         return
 
-    # 6. Place FAK market order
-    order_args = MarketOrderArgs(
+    # 6. Place GTC limit order
+    order_args = OrderArgs(
         token_id=token_id,
-        amount=amount,
+        price=limit_price,
+        size=size,
         side=side,
     )
 
     print("\nSending order...")
     try:
-        signed_order = client.create_market_order(order_args)
-        response = client.post_order(signed_order, OrderType.FAK)
+        signed_order = client.create_order(order_args)
+        response = client.post_order(signed_order, OrderType.GTC)
         print("\nResponse:")
         print(json.dumps(response, indent=2))
     except Exception as exc:

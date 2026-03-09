@@ -35,17 +35,6 @@ def fetch_market(slug):
     return resp.json()
 
 
-def fetch_btc_price_at(ts):
-    try:
-        r = requests.get("https://www.bitstamp.net/api/v2/ohlc/btcusd/", params={
-            "step": 60, "start": ts, "limit": 1,
-        }, timeout=5)
-        data = r.json().get("data", {}).get("ohlc", [])
-        if data:
-            return float(data[0]["open"])
-    except Exception:
-        pass
-    return 0.0
 
 
 class ArbRecorder:
@@ -195,7 +184,9 @@ def load_market(rec: ArbRecorder):
     title = market.get("title") or market.get("question", slug)
     rec.set_market(slug, tokens, outcomes, expires_ts)
 
-    strike = fetch_btc_price_at(ts)
+    strike = fetch_chainlink_strike()
+    if strike == 0:
+        strike = rec.btc_price
     with rec.lock:
         rec.strike_price = strike
 
@@ -230,42 +221,106 @@ def run_rotation(rec: ArbRecorder):
             swap_subscription(rec, old_ids, tokens)
 
 
-def fetch_btc_price() -> float:
-    try:
-        r = requests.get("https://www.bitstamp.net/api/v2/ticker/btcusd/", timeout=5)
-        return float(r.json()["last"])
-    except Exception:
-        return 0.0
-
-
-def run_btc_price(rec: ArbRecorder):
-    price = fetch_btc_price()
-    if price > 0:
-        with rec.lock:
-            rec.btc_price = price
+def fetch_chainlink_strike():
+    """Fetch current BTC/USD from Chainlink via Polymarket RTDS. Blocks until received."""
+    result = [0.0]
+    done = threading.Event()
 
     def on_open(ws):
         ws.send(json.dumps({
-            "event": "bts:subscribe",
-            "data": {"channel": "live_trades_btcusd"},
+            "action": "subscribe",
+            "subscriptions": [{
+                "topic": "crypto_prices_chainlink",
+                "type": "*",
+                "filters": json.dumps({"symbol": "btc/usd"}),
+            }],
         }))
 
     def on_message(ws, message):
+        if not message:
+            return
         data = json.loads(message)
-        if data.get("event") == "trade":
-            price = float(data["data"]["price"])
-            with rec.lock:
-                rec.btc_price = price
+        if "crypto_prices" not in data.get("topic", ""):
+            return
+        payload = data.get("payload", {})
+        if data.get("type") == "subscribe":
+            arr = payload.get("data", [])
+            if arr:
+                result[0] = float(arr[-1].get("value", 0))
+        else:
+            result[0] = float(payload.get("value", 0))
+        if result[0] > 0:
+            done.set()
+            ws.close()
 
+    ws_app = websocket.WebSocketApp(
+        "wss://ws-live-data.polymarket.com",
+        on_open=on_open,
+        on_message=on_message,
+        on_error=lambda ws, e: done.set(),
+        on_close=lambda ws, c, m: None,
+    )
+    threading.Thread(target=ws_app.run_forever, daemon=True).start()
+    done.wait(timeout=10)
+    return result[0]
+
+
+def run_btc_price(rec: ArbRecorder):
+    """Poll BTC/USD price from Chainlink via Polymarket RTDS.
+    
+    Polls every 2 seconds by reconnecting to get the latest snapshot.
+    This matches the settlement source Polymarket uses.
+    """
     while True:
+        result = [0.0]
+        done = threading.Event()
+        
+        def on_open(ws):
+            ws.send(json.dumps({
+                "action": "subscribe",
+                "subscriptions": [{
+                    "topic": "crypto_prices_chainlink",
+                    "type": "*",
+                    "filters": json.dumps({"symbol": "btc/usd"}),
+                }],
+            }))
+        
+        def on_message(ws, message):
+            if not message:
+                return
+            try:
+                data = json.loads(message)
+            except (json.JSONDecodeError, ValueError):
+                return
+            
+            if "crypto_prices" not in data.get("topic", ""):
+                return
+            payload = data.get("payload", {})
+            if data.get("type") == "subscribe":
+                arr = payload.get("data", [])
+                if arr:
+                    result[0] = float(arr[-1].get("value", 0))
+            else:
+                result[0] = float(payload.get("value", 0))
+            
+            if result[0] > 0:
+                done.set()
+                ws.close()
+        
         ws_app = websocket.WebSocketApp(
-            "wss://ws.bitstamp.net",
+            "wss://ws-live-data.polymarket.com",
             on_open=on_open,
             on_message=on_message,
-            on_error=lambda ws, e: None,
+            on_error=lambda ws, e: done.set(),
             on_close=lambda ws, c, m: None,
         )
-        ws_app.run_forever()
+        threading.Thread(target=ws_app.run_forever, daemon=True).start()
+        done.wait(timeout=5)
+        
+        if result[0] > 0:
+            with rec.lock:
+                rec.btc_price = result[0]
+        
         time.sleep(2)
 
 

@@ -68,8 +68,8 @@ Press `q` to quit. The terminal needs to be wide enough to show all panels (~200
 | Service | Purpose |
 |---------|---------|
 | [Polymarket Gamma API](https://gamma-api.polymarket.com) | Market metadata (slug, token IDs, outcomes) |
-| [Polymarket WebSocket](wss://ws-subscriptions-clob.polymarket.com/ws/market) | Real-time order book and trade streaming |
-| [Binance API](https://api.binance.com/api/v3) | BTC/USDT spot price and historical klines |
+| [Polymarket CLOB WebSocket](wss://ws-subscriptions-clob.polymarket.com/ws/market) | Real-time order book and trade streaming |
+| [Polymarket RTDS WebSocket](wss://ws-live-data.polymarket.com) | Chainlink BTC/USD oracle price (strike + live updates) |
 
 ## Dependencies
 

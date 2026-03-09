@@ -40,7 +40,7 @@ source venv/bin/activate
 All shared state lives in `OrderBook` and is protected by a single lock. Background threads:
 - `run_ws()` — WebSocket with auto-reconnect, handles `book` (snapshot) and `price_change` (delta) events. Initial message arrives as a **list**, not a dict.
 - `run_rotation()` — Sleeps until market expiry + 2s, fetches next market, swaps WS subscriptions.
-- `run_btc_price()` — Polls Binance every 1s, updates volatility and BS prices via `record_price()`.
+- `run_btc_price()` — Polls Chainlink BTC/USD via Polymarket RTDS every 2s (reconnects each time to get latest snapshot), updates volatility and BS prices via `record_price()`.
 - `draw()` — Curses loop, redraws every ~100ms. Calls thread-safe getters on `OrderBook`.
 
 ### Key Domain Logic
@@ -57,7 +57,9 @@ All shared state lives in `OrderBook` and is protected by a single lock. Backgro
 |-----|----------|----------|
 | Polymarket Gamma | `https://gamma-api.polymarket.com` | Market metadata by slug |
 | Polymarket CLOB | `https://clob.polymarket.com` | REST orderbook (polybot.py only) |
-| Polymarket WS | `wss://ws-subscriptions-clob.polymarket.com/ws/market` | Real-time book/trade streaming |
-| Binance | `https://api.binance.com/api/v3` | Current BTC price + historical klines for strike |
+| Polymarket WS (CLOB) | `wss://ws-subscriptions-clob.polymarket.com/ws/market` | Real-time book/trade streaming |
+| Polymarket RTDS | `wss://ws-live-data.polymarket.com` | Chainlink BTC/USD oracle price (strike + live price) |
 
-WebSocket requires PING every 10 seconds to stay alive. Subscribe with `{"assets_ids": [...], "type": "market"}`.
+CLOB WebSocket requires PING every 10 seconds to stay alive. Subscribe with `{"assets_ids": [...], "type": "market"}`.
+
+Chainlink price is polled every 2 seconds by reconnecting to RTDS and fetching the latest snapshot. This matches the actual settlement source Polymarket uses.

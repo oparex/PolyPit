@@ -2,3 +2,5 @@ __pycache__/
 venv/
 *.csv
 .idea/
+paper_strategy.py
+cache/
